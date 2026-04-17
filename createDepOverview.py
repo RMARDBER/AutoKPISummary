@@ -1,7 +1,12 @@
 import os
-
+import ollama
 import pandas as pd
 from openpyxl import load_workbook
+
+GENERATE_SUMMERY_FOR = ['SPA3_CSWV3.1.1_JBW41R XLP11 ', 'SPA3_CSWV3.0.1_JBW41R XLP1109', 'SPA3_INT-3873 (XLT1026)', 'SPA3_INT-3816 (XLT1051) ', 'SPA3_INT-3678 (XLT1051)', 'SPA3_INT-3743 (XLT1026)']
+# GENERATE_SUMMERY_FOR = ['SPA3_CSWV3.1.1_JBW41R XLP11 ', 'SPA3_CSWV3.0.1_JBW41R XLP1109']
+
+NO_GENERATE_DEBUG = True
 
 EXTRACTION_MAP_1 = {
     "SW": "A3",
@@ -19,6 +24,7 @@ COLUMNS = ["Test Name", "Test week"] + \
 
 DEP_TEST_SHEET_NAME = "SPA3_"
 LOOP1_IDX = 10 # column K (index 10) is where probability values start in the sheet
+SUMMARY_COL_IDX = 5  # column F (zero-based index in values_only row tuple)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -34,6 +40,22 @@ SEVERITY_LABELS = [
     "Analysis",
     "New",
 ]
+
+SEVERITY_LABELS_OF_INTEREST = [
+    "Severity 5: Critical",
+    "Severity 4: Major",
+    "Severity 3: Moderate",
+    "Severity 2: Minor"
+]
+
+DEBUG_TEMP_FILE_BASE = os.path.join(BASE_DIR, "data", "debug_temp")
+
+LLM_MODEL = "phi3:mini"
+LLM_OPTIONS = {
+    "temperature": 0.6,
+    "num_predict": 350,
+    "num_ctx": 8192
+}
 
 def to_numeric_score(value):
     if value is None:
@@ -57,6 +79,7 @@ def to_numeric_score(value):
 def calc_row_probability(row):
     # Count probability entries
     values = []
+    #TODO: max col should be determined based on first None in VIRA task row
     for cell in row[LOOP1_IDX:]: #start from column K (index 10)
         numeric_value = to_numeric_score(cell)
         if numeric_value is not None:
@@ -67,9 +90,10 @@ def calc_row_probability(row):
 
 
 def count_arts_per_severity(ws):
-    """Count ART entries under each severity/analysis/new section in column A."""
+    """Count ART entries and collect per-issue details under each section."""
     counts = {}
     probability = {}
+    details = {}
     current_label = None
 
     for row in ws.iter_rows(min_col=1, max_col=ws.max_column, values_only=True):
@@ -78,13 +102,58 @@ def count_arts_per_severity(ws):
             current_label = cell_value
             counts[current_label] = 0
             probability[current_label] = []
+            details[current_label] = []
 
-        # elif current_label is not None and isinstance(cell_value, str) and cell_value.startswith("ART"):
-        elif current_label is not None and cell_value is not None and cell_value != '.':
+        elif current_label is not None and cell_value is not None and isinstance(cell_value, str) and cell_value != '.':
+
             counts[current_label] += 1
-            probability[current_label] += calc_row_probability(row)
+            prob_list = calc_row_probability(row)
+            probability[current_label] += prob_list
+            summary_value = row[SUMMARY_COL_IDX]
+            details[current_label].append({
+                "issue": cell_value,
+                "summary": summary_value,
+                "probs": prob_list,
+            })
+    
+    # print(details)
         
-    return counts, probability
+    return counts, probability, details
+
+def create_summary_prompt(details, sheet_name):
+    prompt = "You are a vehicle reliability analyst. Below I present a number of fault reports divided into 5 severity levels. Each fault report contains an ID for identification, a short summary and a frequency in the range 0-5, where values close to 5 indicates that the issue appers frequently. Now you will summerize the fault landscape where you put the most focuse on the faults with highe severity and frequency. Your summary should be about 100-200 words, below are all of the fault reports:\n\n"
+    for severity, issues in details.items():
+        if severity not in SEVERITY_LABELS_OF_INTEREST:
+            continue
+        prompt += f"{severity}\n{'-'*80} \n"
+        for issue in issues:
+            prompt += f"- ID: {issue['issue']}\n"
+            prompt += f"  Summary: {issue['summary']}\n"
+            prompt += f"  Frequency (0-5): {str(round(sum(issue['probs'])/len(issue['probs']),3))}\n\n"
+        prompt += f"{'-'*80}\n\n"
+    prompt += f"Summerize the above information in a concise way, focusing on the most critical and frequent issues. Provide insights on potential root causes and suggest areas for further investigation.\nSummary:\n"
+
+    with open(DEBUG_TEMP_FILE_BASE+sheet_name+".txt", "w", encoding="utf-8") as f:
+        f.write(f"################ Sheet: {sheet_name} ################\n")
+        f.write(f"Prompt ({len(prompt.split())} words):\n")
+        f.write(prompt)
+        f.write("\n")
+
+    return prompt
+
+def generate_summary(details, sheet_name):
+    prompt = create_summary_prompt(details, sheet_name)
+    if not NO_GENERATE_DEBUG:
+        summary = ollama.generate(model=LLM_MODEL, prompt=prompt, options=LLM_OPTIONS)
+    else:
+        summary.respons = "SUM"
+    # summary="hej"
+    # print("Summary response:", response)
+    with open(DEBUG_TEMP_FILE_BASE+sheet_name+".txt", "a", encoding="utf-8") as f:
+        f.write(summary.response)
+        f.write("\n")
+
+    return summary.response
 
 def remove_prefix(value, prefix):
     if isinstance(value, str) and value.startswith(prefix):
@@ -100,7 +169,7 @@ df_lankar = pd.read_excel(SOURCE_FILE, sheet_name="Länkar", header=0)
 df_lankar["SW label"] = df_lankar["SW label"].astype("string").str[-SW_ID_LEN:]
 sw_to_test_week = dict(zip(df_lankar["SW label"].to_list(), df_lankar["Test week"]))
 
-print(df_lankar["SW label"])
+# print(df_lankar["SW label"])
 
 df_out = pd.DataFrame(columns=COLUMNS)
 
@@ -120,11 +189,11 @@ for sheet_name in wb.sheetnames:
             # print(f"{key} ({cell}): {value}")
             df_out.at[sheet_name, key] = value
 
-        print(df_out.at[sheet_name, "SW"][-SW_ID_LEN:],":",sw_to_test_week.get(df_out.at[sheet_name, "SW"][-SW_ID_LEN:]))
+        # print(df_out.at[sheet_name, "SW"][-SW_ID_LEN:],":",sw_to_test_week.get(df_out.at[sheet_name, "SW"][-SW_ID_LEN:]))
         df_out.at[sheet_name, "Test week"] = sw_to_test_week.get(df_out.at[sheet_name, "SW"][-SW_ID_LEN:])
 
         # Count issues per severity level
-        counts, probability = count_arts_per_severity(ws)
+        counts, probability, details = count_arts_per_severity(ws)
         for label in SEVERITY_LABELS:
             if label in df_out.columns:
                 prob_list = probability.get(label)
@@ -133,6 +202,9 @@ for sheet_name in wb.sheetnames:
                 # print(prob_list)
                 # print(avg_prob)
                 df_out.at[sheet_name, label] = "Count: " + str(counts.get(label, 0)) + "\t\t (avg prob: " + str(round(avg_prob,1)) + ")"
+        
+        print("Start summary generation for sheet:", sheet_name)
+        df_out.at[sheet_name, "Summary"] = generate_summary(details, sheet_name)
 
 # for row in ws.iter_rows(min_col=1, max_col=1, values_only=True):
 #     print(row)
