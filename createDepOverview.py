@@ -1,14 +1,16 @@
 import os
 import ollama
+import re
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 
 # GENERATE_SUMMERY_FOR = ['SPA3_CSWV3.1.1_JBW41R XLP11 ', 'SPA3_CSWV3.0.1_JBW41R XLP1109', 'SPA3_INT-3873 (XLT1026)', 'SPA3_INT-3816 (XLT1051) ', 'SPA3_INT-3678 (XLT1051)', 'SPA3_INT-3743 (XLT1026)']
 # GENERATE_SUMMERY_FOR = ['SPA3_CSWV3.1.1_JBW41R XLP11 ', 'SPA3_CSWV3.0.1_JBW41R XLP1109']
+GENERATE_SUMMERY_FOR = ["all"]
 GENERATE_SUMMERY_FOR = []
 
-NO_GENERATE_DEBUG = True
+NO_GENERATE_DEBUG = False
 
 EXTRACTION_MAP_1 = {
     "SW": "A3",
@@ -26,6 +28,8 @@ COLUMNS = ["Test Name", "Test week"] + \
 
 DEP_TEST_SHEET_NAME = "SPA3_"
 LOOP1_IDX = 10 # column K (index 10) is where probability values start in the sheet
+MAX_LOOPS = 35
+MAX_LOOP_IDX = LOOP1_IDX + MAX_LOOPS
 SUMMARY_COL_IDX = 5  # column F (zero-based index in values_only row tuple)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -83,7 +87,7 @@ def calc_row_probability(row):
     # Count probability entries
     values = []
     #TODO: max col should be determined based on first None in VIRA task row
-    for cell in row[LOOP1_IDX:]: #start from column K (index 10)
+    for cell in row[LOOP1_IDX:MAX_LOOP_IDX]: #start from column K (index 10)
         numeric_value = to_numeric_score(cell)
         if numeric_value is not None:
             values.append(numeric_value)
@@ -124,7 +128,7 @@ def count_arts_per_severity(ws):
     return counts, probability, details
 
 def create_summary_prompt(details, sheet_name):
-    prompt = f"You are a vehicle reliability analyst. Below I present a number of fault reports divided into {len(SEVERITY_LABELS_OF_INTEREST)} severity levels, indicating how critical the fault/issue is. Each fault report contains an \"ID\" for identification, a short \"Summary\" and a \"Frequency\" in the range 0-5, where values close to 5 indicates that the issue appers more frequently. The faults are seen on a specific vehicle running an specific software, the reason for the summary is to indicate the overall reliability of the software. Now you will summarize the fault landscape, you will put most focus on the faults with high severity and frequency. Your summary should be {SUMMARY_LENGTH} words long, not longer. Below are all of the fault reports:\n\n"
+    prompt = f"You are a vehicle reliability analyst. Below I present a number of fault reports divided into {len(SEVERITY_LABELS_OF_INTEREST)} severity levels, indicating how critical the fault/issue is. Each fault report contains an \"ID\" for identification, a short \"Summary\" and a \"Frequency\" in the range 0-5, where values close to 5 indicates that the issue appers more frequently. The faults are seen on a specific singular vehicle running an specific software, the reason for the summary is to indicate the overall reliability of the software. Now you will summarize the fault landscape, you will put the majority of the focus on the faults with high severity and frequency. Your summary should be {SUMMARY_LENGTH} words long, not longer. Below are all of the fault reports:\n\n"
     for severity, issues in details.items():
         if severity not in SEVERITY_LABELS_OF_INTEREST:
             continue
@@ -137,7 +141,7 @@ def create_summary_prompt(details, sheet_name):
                 prompt += f"  Frequency (0-5): {mean_prob}\n\n"
         prompt += f"{'-'*80}\n\n"
     # prompt += f"Summarize the above information in a concise way, focusing on the most severe and frequent issues. Provide insights on potential root causes and suggest areas for further investigation.\nSummary:\n"
-    prompt += f"Summarize the above information in a concise way, focusing on the most severe and frequent issues aswell as less sever issues if they have very high frequency. You do not need to mention low severity, low frequency issues if there is no direct reason to do so. Do not include the \"Frequency\" values in the summary, rather use word, e.g. high frequency. Keep the summary factual and objective and very shortly mentioned the overall \"grade\" of the tested vehicle software combination.\nSummary:\n"
+    prompt += f"Summarize the above information in a concise way, focusing on the most severe and frequent issues, aswell as less sever issues if they have very high frequency. You do not need to mention low severity, low frequency issues if there is no direct reason to do so. Do not include the \"Frequency\" values in the summary, rather use word, e.g. high frequency. Keep the summary factual and objective and very shortly mentioned the overall \"grade\" of the tested vehicle software combination.\nYour {SUMMARY_LENGTH}-word summary:\n"
 
     with open(DEBUG_TEMP_FILE_BASE+sheet_name+".txt", "w", encoding="utf-8") as f:
         f.write(f"################ Sheet: {sheet_name} ################\n")
@@ -179,8 +183,6 @@ sw_to_test_week = dict(zip(df_lankar["SW label"].to_list(), df_lankar["Test week
 
 df_out = pd.DataFrame(columns=COLUMNS)
 
-print("Sheet names:", wb.sheetnames)
-
 for sheet_name in wb.sheetnames:
     if sheet_name[0:len(DEP_TEST_SHEET_NAME)] == DEP_TEST_SHEET_NAME:
         ws = wb[sheet_name]
@@ -192,6 +194,7 @@ for sheet_name in wb.sheetnames:
                 value = remove_prefix(value, "SW under test: ")
             if key == "Vehicle ID":
                 value = remove_prefix(value, "Vehicle ID: ")
+                value = re.sub(r'\s+', '', value).split('/', 1)[-1] # remove reg nr. if included
             if key == "KPI" and value is not None:
                 value = str(value)
             # print(f"{key} ({cell}): {value}")
@@ -211,7 +214,7 @@ for sheet_name in wb.sheetnames:
                 # print(avg_prob)
                 df_out.at[sheet_name, label] = "Count: " + str(counts.get(label, 0)) + "\t\t (avg prob: " + str(round(avg_prob,1)) + ")"
         
-        if sheet_name in GENERATE_SUMMERY_FOR:
+        if ("all" in GENERATE_SUMMERY_FOR) or (sheet_name in GENERATE_SUMMERY_FOR):
             print("Start summary generation for sheet:", sheet_name)
             df_out.at[sheet_name, "Summary"] = generate_summary(details, sheet_name)
         else:
@@ -277,6 +280,8 @@ def update_excel(df):
     wb.save(OUTPUT_FILE)
     wb.close()
 
+
+# print(df_out["Test Name"].tolist())
 
 # Check if output file exists and is valid; create new or update existing
 if os.path.exists(OUTPUT_FILE):
