@@ -2,9 +2,11 @@ import os
 import ollama
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 
-GENERATE_SUMMERY_FOR = ['SPA3_CSWV3.1.1_JBW41R XLP11 ', 'SPA3_CSWV3.0.1_JBW41R XLP1109', 'SPA3_INT-3873 (XLT1026)', 'SPA3_INT-3816 (XLT1051) ', 'SPA3_INT-3678 (XLT1051)', 'SPA3_INT-3743 (XLT1026)']
+# GENERATE_SUMMERY_FOR = ['SPA3_CSWV3.1.1_JBW41R XLP11 ', 'SPA3_CSWV3.0.1_JBW41R XLP1109', 'SPA3_INT-3873 (XLT1026)', 'SPA3_INT-3816 (XLT1051) ', 'SPA3_INT-3678 (XLT1051)', 'SPA3_INT-3743 (XLT1026)']
 # GENERATE_SUMMERY_FOR = ['SPA3_CSWV3.1.1_JBW41R XLP11 ', 'SPA3_CSWV3.0.1_JBW41R XLP1109']
+GENERATE_SUMMERY_FOR = []
 
 NO_GENERATE_DEBUG = True
 
@@ -30,6 +32,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SOURCE_FILE = os.path.join(BASE_DIR, "data", "PKV Dependability SPA3 Test workbook.xlsx")
 OUTPUT_FILE = os.path.join(BASE_DIR, "data", "PKV Dependability Overview.xlsx")
+DEBUG_TEMP_FILE_BASE = os.path.join(BASE_DIR, "data", "debug_temp_")
 
 SEVERITY_LABELS = [
     "Severity 5: Critical",
@@ -44,18 +47,18 @@ SEVERITY_LABELS = [
 SEVERITY_LABELS_OF_INTEREST = [
     "Severity 5: Critical",
     "Severity 4: Major",
-    "Severity 3: Moderate",
-    "Severity 2: Minor"
+    "Severity 3: Moderate"
 ]
-
-DEBUG_TEMP_FILE_BASE = os.path.join(BASE_DIR, "data", "debug_temp")
 
 LLM_MODEL = "phi3:mini"
 LLM_OPTIONS = {
     "temperature": 0.6,
-    "num_predict": 350,
+    "num_predict": 500,
     "num_ctx": 8192
 }
+LLM_TAG = " (AUTO GENERATED | LLM model: " + LLM_MODEL + ", options: " + str(LLM_OPTIONS) + ")"
+
+SUMMARY_LENGTH = "200" # desired summary length in words, span "x-y" format is ok
 
 def to_numeric_score(value):
     if value is None:
@@ -66,7 +69,7 @@ def to_numeric_score(value):
         normalized = value.strip()
         if not normalized:
             return None
-        if normalized in {"OK", "NT"}:
+        if str(normalized).lower() in {"ok", "nt"}:
             return 0.0
         # normalized = normalized.replace(",", ".")
         try:
@@ -121,17 +124,20 @@ def count_arts_per_severity(ws):
     return counts, probability, details
 
 def create_summary_prompt(details, sheet_name):
-    prompt = "You are a vehicle reliability analyst. Below I present a number of fault reports divided into 5 severity levels. Each fault report contains an ID for identification, a short summary and a frequency in the range 0-5, where values close to 5 indicates that the issue appers frequently. Now you will summerize the fault landscape where you put the most focuse on the faults with highe severity and frequency. Your summary should be about 100-200 words, below are all of the fault reports:\n\n"
+    prompt = f"You are a vehicle reliability analyst. Below I present a number of fault reports divided into {len(SEVERITY_LABELS_OF_INTEREST)} severity levels, indicating how critical the fault/issue is. Each fault report contains an \"ID\" for identification, a short \"Summary\" and a \"Frequency\" in the range 0-5, where values close to 5 indicates that the issue appers more frequently. The faults are seen on a specific vehicle running an specific software, the reason for the summary is to indicate the overall reliability of the software. Now you will summarize the fault landscape, you will put most focus on the faults with high severity and frequency. Your summary should be {SUMMARY_LENGTH} words long, not longer. Below are all of the fault reports:\n\n"
     for severity, issues in details.items():
         if severity not in SEVERITY_LABELS_OF_INTEREST:
             continue
         prompt += f"{severity}\n{'-'*80} \n"
         for issue in issues:
-            prompt += f"- ID: {issue['issue']}\n"
-            prompt += f"  Summary: {issue['summary']}\n"
-            prompt += f"  Frequency (0-5): {str(round(sum(issue['probs'])/len(issue['probs']),3))}\n\n"
+            mean_prob = float(round(sum(issue['probs'])/len(issue['probs']),3))
+            if mean_prob > 0.0: # remove 0 prob issues
+                prompt += f"- ID: {issue['issue']}\n"
+                prompt += f"  Summary: {issue['summary']}\n"
+                prompt += f"  Frequency (0-5): {mean_prob}\n\n"
         prompt += f"{'-'*80}\n\n"
-    prompt += f"Summerize the above information in a concise way, focusing on the most critical and frequent issues. Provide insights on potential root causes and suggest areas for further investigation.\nSummary:\n"
+    # prompt += f"Summarize the above information in a concise way, focusing on the most severe and frequent issues. Provide insights on potential root causes and suggest areas for further investigation.\nSummary:\n"
+    prompt += f"Summarize the above information in a concise way, focusing on the most severe and frequent issues aswell as less sever issues if they have very high frequency. You do not need to mention low severity, low frequency issues if there is no direct reason to do so. Do not include the \"Frequency\" values in the summary, rather use word, e.g. high frequency. Keep the summary factual and objective and very shortly mentioned the overall \"grade\" of the tested vehicle software combination.\nSummary:\n"
 
     with open(DEBUG_TEMP_FILE_BASE+sheet_name+".txt", "w", encoding="utf-8") as f:
         f.write(f"################ Sheet: {sheet_name} ################\n")
@@ -146,14 +152,14 @@ def generate_summary(details, sheet_name):
     if not NO_GENERATE_DEBUG:
         summary = ollama.generate(model=LLM_MODEL, prompt=prompt, options=LLM_OPTIONS)
     else:
-        summary.respons = "SUM"
+        summary = type('obj', (object,), {'response' : "SUM"})()
     # summary="hej"
     # print("Summary response:", response)
     with open(DEBUG_TEMP_FILE_BASE+sheet_name+".txt", "a", encoding="utf-8") as f:
-        f.write(summary.response)
+        f.write(summary.response + LLM_TAG)
         f.write("\n")
 
-    return summary.response
+    return summary.response + LLM_TAG
 
 def remove_prefix(value, prefix):
     if isinstance(value, str) and value.startswith(prefix):
@@ -172,6 +178,8 @@ sw_to_test_week = dict(zip(df_lankar["SW label"].to_list(), df_lankar["Test week
 # print(df_lankar["SW label"])
 
 df_out = pd.DataFrame(columns=COLUMNS)
+
+print("Sheet names:", wb.sheetnames)
 
 for sheet_name in wb.sheetnames:
     if sheet_name[0:len(DEP_TEST_SHEET_NAME)] == DEP_TEST_SHEET_NAME:
@@ -203,8 +211,12 @@ for sheet_name in wb.sheetnames:
                 # print(avg_prob)
                 df_out.at[sheet_name, label] = "Count: " + str(counts.get(label, 0)) + "\t\t (avg prob: " + str(round(avg_prob,1)) + ")"
         
-        print("Start summary generation for sheet:", sheet_name)
-        df_out.at[sheet_name, "Summary"] = generate_summary(details, sheet_name)
+        if sheet_name in GENERATE_SUMMERY_FOR:
+            print("Start summary generation for sheet:", sheet_name)
+            df_out.at[sheet_name, "Summary"] = generate_summary(details, sheet_name)
+        else:
+            print("Skipped summary generation for sheet:", sheet_name)
+            df_out.at[sheet_name, "Summary"] = None # use None to indicate not generated, needed for filling only regenerated summary cells
 
 # for row in ws.iter_rows(min_col=1, max_col=1, values_only=True):
 #     print(row)
@@ -224,16 +236,60 @@ def create_excel(df):
     for column in ws.columns:
         ws.column_dimensions[column[0].column_letter].width = 30
 
+    # Summary column (I): make wider and increase row height for long text cells
+    ws.column_dimensions["I"].width = 70
+    for row_idx in range(2, ws.max_row + 1):
+        ws.row_dimensions[row_idx].height = 90
+
+    # Align all populated cells to top-left
+    top_left_alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.alignment = top_left_alignment
+
     ws.auto_filter.ref = ws.dimensions
 
     wb.save(OUTPUT_FILE)
     wb.close()
 
-def populate_excel(df):
-    pass
+def update_excel(df):
+    """Update existing Excel file with new data while preserving formatting and layout."""
+    wb = load_workbook(OUTPUT_FILE)
+    ws = wb.active
+
+    # Get the summary column index (last column in df, 1-based for openpyxl)
+    summary_col_idx = len(df.columns)
+    
+    # Write new data starting from row 2
+    for r_idx, row in enumerate(df.values, start=2):
+        for c_idx, value in enumerate(row, start=1):
+            # For Summary column, only write if value is not None/empty
+            if c_idx == summary_col_idx:
+                # Check for None or pandas NaN
+                if value is None or (isinstance(value, float) and pd.isna(value)):
+                    continue  # Skip, keep existing value
+            ws.cell(row=r_idx, column=c_idx).value = value
+
+    # # Re-apply row heights for data rows to accommodate content
+    # for row_idx in range(2, ws.max_row + 1):
+    #     ws.row_dimensions[row_idx].height = 90
+
+    wb.save(OUTPUT_FILE)
+    wb.close()
 
 
-create_excel(df_out)
+# Check if output file exists and is valid; create new or update existing
+if os.path.exists(OUTPUT_FILE):
+    try:
+        print(f"Updating existing file: {OUTPUT_FILE}")
+        update_excel(df_out)
+    except Exception as e:
+        print(f"Warning: Could not update existing file ({e}). Creating new file instead.")
+        create_excel(df_out)
+else:
+    print(f"Creating new file: {OUTPUT_FILE}")
+    create_excel(df_out)
+
 os.startfile(OUTPUT_FILE)
 
 
